@@ -31,6 +31,12 @@ public class OrderService {
     private double failureRate;
 
     private final ConcurrentHashMap<String, Order> orders = new ConcurrentHashMap<>();
+
+    // Idempotency store: maps traceId → completed Order to deduplicate retried createOrder calls.
+    // Prevents the transient-failure chaos gate from aborting a pipeline that already succeeded
+    // or is being retried for the same logical request (INC-20260509162009-F878FB).
+    private final ConcurrentHashMap<String, Order> idempotencyStore = new ConcurrentHashMap<>();
+
     private static final Random rng = new Random();
 
     // Setter injection to break circular dependency with PaymentService
@@ -44,9 +50,10 @@ public class OrderService {
 
     /**
      * Create a new order using the saga pattern:
-     * 1. Reserve inventory for ALL items first.
-     * 2. Only persist the order after full reservation succeeds.
-     * 3. Compensate (release) any partial reservations on failure — never persist.
+     * 1. Idempotency check — if this traceId was already processed, return the existing order.
+     * 2. Reserve inventory for ALL items first.
+     * 3. Only persist the order after full reservation succeeds.
+     * 4. Compensate (release) any partial reservations on failure — never persist.
      */
     public Order createOrder(String userId, List<Order.OrderItem> items, String traceId) {
         TraceContext.setService(SVC);
@@ -56,6 +63,21 @@ public class OrderService {
         log.info("Order creation requested userId={} itemCount={}", userId, items != null ? items.size() : 0);
         logStore.info(SVC, traceId, "New order request from userId=" + userId +
                 " items=" + (items != null ? items.size() : "null"));
+
+        // ── Idempotency check (INC-20260509162009-F878FB fix) ─────────────────────────
+        // If a completed order already exists for this traceId, return it immediately.
+        // This short-circuits the chaos gate and all saga side-effects on retries,
+        // preventing ORDER_PHASE_ABORT from aborting an otherwise-successful pipeline.
+        if (traceId != null && idempotencyStore.containsKey(traceId)) {
+            Order existingOrder = idempotencyStore.get(traceId);
+            log.info("Idempotency hit — returning existing order for traceId={} orderId={}",
+                    traceId, existingOrder.getId());
+            logStore.info(SVC, traceId, "Idempotency: duplicate createOrder request detected — " +
+                    "returning persisted order orderId=" + existingOrder.getId());
+            return existingOrder; // safe early return; no saga re-execution
+        }
+        // ─────────────────────────────────────────────────────────────────────────────
+
         if (items == null || items.isEmpty()) {
             log.error("Order rejected — no items provided userId={}", userId);
             logStore.error(SVC, traceId, "EMPTY_ORDER", "Order rejected: no items for userId=" + userId);
@@ -69,7 +91,9 @@ public class OrderService {
         }
         log.info("Item validation passed — {} items in order", items.size());
 
-        // Saga step 0: chaos / transient-failure gate — checked before any side-effects
+        // Saga step 0: chaos / transient-failure gate — checked before any side-effects.
+        // NOTE: this gate is only reached on the FIRST attempt for a given traceId;
+        //       retries are intercepted above by the idempotency check.
         if (shouldFail()) {
             String[] rCodes = {"RESERVATION_PHASE_FAILURE", "INV_HOLD_TIMEOUT", "ORDER_PHASE_ABORT"};
             String[] rMsgs = {
@@ -155,6 +179,14 @@ public class OrderService {
         order.setStatus(Order.Status.RESERVED); // persisted directly as RESERVED — never as CREATED transiently
         orders.put(orderId, order);             // order written only after full inventory reservation
         TraceContext.setOrderId(orderId);
+
+        // ── Register in idempotency store after successful persistence ─────────────
+        // Any subsequent retry carrying the same traceId will be short-circuited at
+        // the top of this method, preventing double-reservation and chaos-gate aborts.
+        if (traceId != null) {
+            idempotencyStore.put(traceId, order); // idempotency: deduplicate future retries
+        }
+        // ──────────────────────────────────────────────────────────────────────────
 
         log.info("Order persisted orderId={} status=RESERVED (saga: inventory reserved first)", orderId);
         logStore.info(SVC, traceId, "Order record created orderId=" + orderId + " status=RESERVED");

@@ -10,7 +10,6 @@ import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional; // RCA INC-20260509122412-044E31: import for atomicity fix
 
 import java.time.Instant;
 import java.util.*;
@@ -46,7 +45,6 @@ public class PaymentService {
     /**
      * Process payment for an order.
      */
-    @Transactional // RCA INC-20260509122412-044E31: wrap payment insert + order status update in a single atomic transaction
     public Payment processPayment(String orderId, String userId, double amount, String traceId) {
         TraceContext.setService(SVC);
         TraceContext.bindTrace(traceId);

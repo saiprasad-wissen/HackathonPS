@@ -15,6 +15,7 @@ import org.springframework.stereotype.Service;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 /**
@@ -131,6 +132,11 @@ public class InventoryService {
 
     /**
      * Hard deduct (used by payment confirmation path).
+     *
+     * FIX (INC-20260509162009-2C1102 — NEGATIVE_STOCK): Replace the bare addAndGet(-quantity)
+     * with a CAS spin loop so that the check-then-act sequence is atomic. Two concurrent threads
+     * can no longer both pass the stock-sufficiency check and both subtract, because compareAndSet
+     * will fail for the second thread once the first has already lowered the value.
      */
     public boolean deductStock(String productId, int quantity, String traceId) {
         TraceContext.setService(SVC);
@@ -147,20 +153,26 @@ public class InventoryService {
             return true;
         }
 
-        int newStock = item.getStockRef().addAndGet(-quantity);
-        if (newStock < 0) {
-            String[] negCodes = {"NEGATIVE_STOCK", "STOCK_BELOW_ZERO", "INV_COUNTER_UNDERFLOW", "STOCK_LEVEL_ANOMALY"};
-            String[] negMsgs = {
-                "Unexpected negative stock detected for " + productId + " value=" + newStock,
-                "stock counter below threshold — prod=" + productId + " val=" + newStock,
-                "inventory level underflow for " + productId,
-                "stock value out of expected range current=" + newStock
-            };
-            int p = rng.nextInt(negCodes.length);
-            log.warn("stock below zero productId={} stock={}", productId, newStock);
-            logStore.warn(SVC, traceId, negCodes[p], negMsgs[p]);
-        }
+        // Thread-safe CAS spin loop: atomically verify sufficient stock before deducting,
+        // preventing any concurrent thread from driving the counter below zero.
+        AtomicInteger stockRef = item.getStockRef();
+        int current;
+        do {
+            current = stockRef.get();
+            if (current < quantity) {
+                // Insufficient stock — abort deduction rather than allow a negative value.
+                log.warn("Insufficient stock for deduction productId={} available={} requested={}",
+                        productId, current, quantity);
+                logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK",
+                        "Deduction aborted — insufficient stock for " + productId
+                                + " available=" + current + " requested=" + quantity);
+                return false;
+            }
+            // compareAndSet retries the loop if another thread mutated the value between get() and here,
+            // ensuring the check and the decrement are effectively atomic together.
+        } while (!stockRef.compareAndSet(current, current - quantity));
 
+        int newStock = current - quantity; // value we successfully committed
         item.setLastUpdated(Instant.now());
         log.info("Stock deducted productId={} newStock={}", productId, newStock);
         logStore.info(SVC, traceId, "Deduction complete for " + productId + " newStock=" + newStock);

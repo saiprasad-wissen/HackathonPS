@@ -67,6 +67,11 @@ public class InventoryService {
 
     /**
      * Reserve stock for an order.
+     * FIX (INC-20260509103311-B56B73): Replaced non-atomic check-then-act with an atomic
+     * CAS loop on the AtomicInteger stockRef, equivalent to:
+     *   UPDATE inventory SET stock=stock-qty WHERE stock >= qty
+     * This prevents partial reservations caused by concurrent threads reading the same
+     * stock level and both successfully decrementing it past zero.
      */
     public boolean reserveStock(String productId, int quantity, String traceId) {
         TraceContext.setService(SVC);
@@ -98,23 +103,27 @@ public class InventoryService {
             throw new RuntimeException("Inventory store transient failure");
         }
 
-        int current = item.getStock();
-        log.info("Current stock for {} = {}, requesting {}", productId, current, quantity);
+        // Atomic CAS loop: mirrors "UPDATE … SET stock=stock-qty WHERE stock >= qty".
+        // Retries only on a concurrent modification (witnessed value changed mid-loop);
+        // returns false immediately if stock is genuinely insufficient at any witnessed value.
+        int witnessed;
+        do {
+            witnessed = item.getStockRef().get(); // atomic read of current stock
+            log.info("Current stock for {} = {}, requesting {}", productId, witnessed, quantity);
+            if (witnessed < quantity) {
+                String[] msgs = {
+                    "insufficient stock — available=" + witnessed + " requested=" + quantity + " sku=" + productId,
+                    "stock check fail: have=" + witnessed + " need=" + quantity,
+                    "cannot reserve — stock level below threshold for " + productId
+                };
+                log.warn("Insufficient stock productId={} available={} requested={}", productId, witnessed, quantity);
+                logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
+                return false;
+            }
+            // compareAndSet atomically applies the deduction only if stock hasn't changed
+            // since the witnessed read — preventing any concurrent over-reservation.
+        } while (!item.getStockRef().compareAndSet(witnessed, witnessed - quantity));
 
-        if (current < quantity) {
-            String[] msgs = {
-                "insufficient stock — available=" + current + " requested=" + quantity + " sku=" + productId,
-                "stock check fail: have=" + current + " need=" + quantity,
-                "cannot reserve — stock level below threshold for " + productId
-            };
-            log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
-            logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
-            return false;
-        }
-
-        try { Thread.sleep(10); } catch (InterruptedException ignored) {}
-
-        item.setStock(current - quantity);
         item.setReservedStock(item.getReservedStock() + quantity);
         item.setLastUpdated(Instant.now());
 

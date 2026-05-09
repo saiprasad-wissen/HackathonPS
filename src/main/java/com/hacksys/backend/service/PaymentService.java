@@ -138,7 +138,10 @@ public class PaymentService {
             logStore.error(SVC, traceId, pCodes[pp], pMsgs[pp]);
         }
 
-        schedulePaymentConfirmation(paymentId, orderId, traceId);
+        // Fix INC-20260509133449-B866EB: snapshot caller MDC before @Async dispatch
+        // so the child thread can restore full trace context (trace_id, order_id, etc.)
+        Map<String, String> callerMdcContext = MDC.getCopyOfContextMap();
+        schedulePaymentConfirmation(paymentId, orderId, traceId, callerMdcContext);
 
         log.info("Payment completed successfully paymentId={}", paymentId);
         logStore.info(SVC, traceId, "Payment flow complete paymentId=" + paymentId + " orderId=" + orderId);
@@ -195,38 +198,62 @@ public class PaymentService {
         return paymentsById.get(paymentId);
     }
 
+    /**
+     * Async payment confirmation notification.
+     *
+     * Fix INC-20260509133449-B866EB: accepts the caller's MDC context map and
+     * restores it at the start of the worker thread so that trace_id and all
+     * diagnostic fields are present in every log line emitted from this method.
+     * MDC is always cleared in the finally block; the MdcTaskDecorator in
+     * AsyncConfig also provides a safety-net restore/clear at the executor level.
+     */
     @Async("taskExecutor")
-    public CompletableFuture<Void> schedulePaymentConfirmation(String paymentId, String orderId, String callerTraceId) {
+    public CompletableFuture<Void> schedulePaymentConfirmation(
+            String paymentId,
+            String orderId,
+            String callerTraceId,
+            Map<String, String> callerMdcContext) { // Fix: receive caller MDC snapshot
+
+        // Fix INC-20260509133449-B866EB: restore MDC context in this async worker thread
         try {
-            Thread.sleep(1000 + new Random().nextInt(2000));
-        } catch (InterruptedException ignored) {}
+            if (callerMdcContext != null) {
+                MDC.setContextMap(callerMdcContext);
+            }
 
-        Payment p = paymentsById.get(paymentId);
-        if (p == null) {
-            log.error("Async confirmation: payment not found paymentId={}", paymentId);
-            logStore.error(SVC, "ASYNC-ORPHAN", "CONFIRM_PAYMENT_NOT_FOUND",
-                    "Async job could not find payment record paymentId=" + paymentId);
+            try {
+                Thread.sleep(1000 + new Random().nextInt(2000));
+            } catch (InterruptedException ignored) {}
+
+            Payment p = paymentsById.get(paymentId);
+            if (p == null) {
+                log.error("Async confirmation: payment not found paymentId={}", paymentId);
+                logStore.error(SVC, callerTraceId, "CONFIRM_PAYMENT_NOT_FOUND",
+                        "Async job could not find payment record paymentId=" + paymentId);
+                return CompletableFuture.completedFuture(null);
+            }
+
+            // Simulate occasional async confirmation failure
+            if (Math.random() < 0.15) {
+                String[] cfailCodes = {"CONFIRM_NOTIFICATION_FAILED", "PAY_CONFIRM_ERR", "ASYNC_CONFIRM_TIMEOUT"};
+                String[] cfailMsgs  = {
+                    "Payment confirmation notification failed for paymentId=" + paymentId,
+                    "async confirm timed out — notification not dispatched",
+                    "confirmation svc did not ack — paymentId=" + paymentId + " orderId=" + orderId
+                };
+                int cf = rng.nextInt(cfailCodes.length);
+                log.warn("Async payment confirmation failed — notification not sent paymentId={}", paymentId);
+                logStore.skewWarn(SVC, callerTraceId, cfailCodes[cf], cfailMsgs[cf]);
+            } else {
+                log.info("Async confirmation sent paymentId={}", paymentId);
+                logStore.skewInfo(SVC, callerTraceId,
+                        "Payment confirmation dispatched for paymentId=" + paymentId);
+            }
+
             return CompletableFuture.completedFuture(null);
+        } finally {
+            // Fix INC-20260509133449-B866EB: always clear MDC to prevent context leakage
+            MDC.clear();
         }
-
-        // Simulate occasional async confirmation failure
-        if (Math.random() < 0.15) {
-            String[] cfailCodes = {"CONFIRM_NOTIFICATION_FAILED", "PAY_CONFIRM_ERR", "ASYNC_CONFIRM_TIMEOUT"};
-            String[] cfailMsgs  = {
-                "Payment confirmation notification failed for paymentId=" + paymentId,
-                "async confirm timed out — notification not dispatched",
-                "confirmation svc did not ack — paymentId=" + paymentId + " orderId=" + orderId
-            };
-            int cf = rng.nextInt(cfailCodes.length);
-            log.warn("Async payment confirmation failed — notification not sent paymentId={}", paymentId);
-            logStore.skewWarn(SVC, "ASYNC-ORPHAN", cfailCodes[cf], cfailMsgs[cf]);
-        } else {
-            log.info("Async confirmation sent paymentId={}", paymentId);
-            logStore.skewInfo(SVC, "ASYNC-" + callerTraceId,
-                    "Payment confirmation dispatched for paymentId=" + paymentId);
-        }
-
-        return CompletableFuture.completedFuture(null);
     }
 
     private boolean shouldFail() {

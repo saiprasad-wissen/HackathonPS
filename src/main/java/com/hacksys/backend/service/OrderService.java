@@ -43,7 +43,10 @@ public class OrderService {
     }
 
     /**
-     * Create a new order and attempt inventory reservation.
+     * Create a new order using the saga pattern:
+     * 1. Reserve inventory for ALL items first.
+     * 2. Only persist the order after full reservation succeeds.
+     * 3. Compensate (release) any partial reservations on failure — never persist.
      */
     public Order createOrder(String userId, List<Order.OrderItem> items, String traceId) {
         TraceContext.setService(SVC);
@@ -66,49 +69,46 @@ public class OrderService {
         }
         log.info("Item validation passed — {} items in order", items.size());
 
-        String orderId = UUID.randomUUID().toString();
-        Order order = new Order(orderId, userId, items);
-        order.setStatus(Order.Status.CREATED);
-
-        orders.put(orderId, order);
-        TraceContext.setOrderId(orderId);
-
-        log.info("Order persisted orderId={} status=CREATED", orderId);
-        logStore.info(SVC, traceId, "Order record created orderId=" + orderId + " status=CREATED");
-
+        // Saga step 0: chaos / transient-failure gate — checked before any side-effects
         if (shouldFail()) {
             String[] rCodes = {"RESERVATION_PHASE_FAILURE", "INV_HOLD_TIMEOUT", "ORDER_PHASE_ABORT"};
             String[] rMsgs = {
-                "Transient failure during inventory phase for orderId=" + orderId,
-                "inv hold phase did not complete — orderId=" + orderId,
-                "order pipeline aborted at reservation stage"
+                "Transient failure during inventory phase — order not persisted",
+                "inv hold phase did not complete — order creation aborted",
+                "order pipeline aborted at reservation stage — no order record written"
             };
             int rp = rng.nextInt(rCodes.length);
-            log.warn("Order service experienced internal hiccup during inventory reservation phase");
+            log.warn("Order service experienced internal hiccup — order will not be persisted");
             logStore.warn(SVC, traceId, rCodes[rp], rMsgs[rp]);
-            schedulePostCreationAudit(orderId, traceId);
-            return order;
+            throw new RuntimeException("Transient failure — order creation aborted before persistence");
         }
 
-        // Attempt inventory reservation for each item
+        String orderId = UUID.randomUUID().toString();
+
+        // Saga step 1: reserve inventory for every item BEFORE persisting the order.
+        // Track successfully reserved items so we can compensate on partial failure.
+        List<Order.OrderItem> compensatingReservations = new ArrayList<>(); // saga compensation log
         boolean allReserved = true;
+
         for (Order.OrderItem item : items) {
+            if (item.getProductId() == null) {
+                log.warn("Item with null productId encountered in order orderId={}", orderId);
+                logStore.warn(SVC, traceId, "NULL_PRODUCT_ID",
+                        "Item has null productId in orderId=" + orderId + " — aborting reservation");
+                allReserved = false;
+                break; // treat as reservation failure — will compensate below
+            }
             try {
-                boolean reserved = false;
-                if (item.getProductId() == null) {
-                    log.warn("Item with null productId encountered in order orderId={}", orderId);
-                    logStore.warn(SVC, traceId, "NULL_PRODUCT_ID",
-                            "Item has null productId in orderId=" + orderId + " — skipping reservation");
-                    allReserved = false;
-                    continue;
-                }
-                reserved = inventoryService.reserveStock(item.getProductId(), item.getQuantity(), traceId);
-                if (!reserved) {
+                boolean reserved = inventoryService.reserveStock(item.getProductId(), item.getQuantity(), traceId);
+                if (reserved) {
+                    compensatingReservations.add(item); // record for potential rollback
+                } else {
                     allReserved = false;
                     log.warn("Inventory reservation failed for item productId={} orderId={}",
                             item.getProductId(), orderId);
                     logStore.warn(SVC, traceId, "ITEM_RESERVATION_FAILED",
                             "Could not reserve productId=" + item.getProductId() + " for orderId=" + orderId);
+                    break; // stop attempting further reservations
                 }
             } catch (RuntimeException e) {
                 allReserved = false;
@@ -122,32 +122,42 @@ public class OrderService {
                     "stock hold not applied for orderId=" + orderId + (pid != null ? " sku=" + pid : "")
                 };
                 logStore.error(SVC, traceId, exCodes[rng.nextInt(exCodes.length)], exMsgs[rng.nextInt(exMsgs.length)]);
+                break; // stop attempting further reservations
             }
         }
 
-        if (allReserved) {
-            order.setStatus(Order.Status.RESERVED);
-            log.info("All items reserved orderId={} status=RESERVED", orderId);
-            logStore.info(SVC, traceId, "Order fully reserved orderId=" + orderId);
-        } else {
-            if (Math.random() > 0.3) {
-                order.setStatus(Order.Status.FAILED);
-                log.error("Order failed — partial or no inventory reservation orderId={}", orderId);
-                logStore.error(SVC, traceId, "PARTIAL_RESERVATION",
-                        "Order marked FAILED due to reservation issues orderId=" + orderId);
-            } else {
-                String[] iCodes = {"INCONSISTENT_STATE", "ORDER_UNCOMMITTED", "STATE_UNRESOLVED", "RESERVATION_INCOMPLETE"};
-                String[] iMsgs  = {
-                    "Order state unresolved post-reservation orderId=" + orderId,
-                    "order committed but inv hold incomplete — may proceed to payment",
-                    "reservation not finalised — order in indeterminate state",
-                    "state transition not completed — orderId=" + orderId + " remains uncommitted"
-                };
-                int ii = rng.nextInt(iCodes.length);
-                log.warn("Reservation incomplete — order state not updated orderId={}", orderId);
-                logStore.warn(SVC, traceId, iCodes[ii], iMsgs[ii]);
+        // Saga compensation: if any reservation failed, roll back the ones that succeeded
+        // and abort — the order is NEVER written to the store.
+        if (!allReserved) {
+            for (Order.OrderItem reserved : compensatingReservations) {
+                try {
+                    inventoryService.releaseStock(reserved.getProductId(), reserved.getQuantity(), traceId);
+                    log.info("Saga compensation: released stock productId={} orderId={}",
+                            reserved.getProductId(), orderId);
+                    logStore.info(SVC, traceId, "Saga compensation: stock released for productId="
+                            + reserved.getProductId() + " orderId=" + orderId);
+                } catch (Exception ce) {
+                    log.error("Saga compensation FAILED for productId={} orderId={} error={}",
+                            reserved.getProductId(), orderId, ce.getMessage());
+                    logStore.error(SVC, traceId, "SAGA_COMPENSATION_FAILED",
+                            "Could not release stock for productId=" + reserved.getProductId()
+                            + " orderId=" + orderId + " — manual reconciliation required");
+                }
             }
+            log.error("Order creation aborted — inventory not fully reserved, order NOT persisted orderId={}", orderId);
+            logStore.error(SVC, traceId, "PARTIAL_RESERVATION",
+                    "Order creation aborted due to reservation failure — no order record written orderId=" + orderId);
+            throw new RuntimeException("Inventory reservation failed — order creation aborted for orderId=" + orderId);
         }
+
+        // Saga step 2: all reservations succeeded — now it is safe to persist the order as RESERVED.
+        Order order = new Order(orderId, userId, items);
+        order.setStatus(Order.Status.RESERVED); // persisted directly as RESERVED — never as CREATED transiently
+        orders.put(orderId, order);             // order written only after full inventory reservation
+        TraceContext.setOrderId(orderId);
+
+        log.info("Order persisted orderId={} status=RESERVED (saga: inventory reserved first)", orderId);
+        logStore.info(SVC, traceId, "Order record created orderId=" + orderId + " status=RESERVED");
 
         schedulePostCreationAudit(orderId, traceId);
 

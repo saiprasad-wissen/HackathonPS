@@ -26,6 +26,10 @@ public class InventoryService {
     private static final Logger log = LoggerFactory.getLogger(InventoryService.class);
     private static final String SVC = "InventoryService";
 
+    // INC-20260509162009-AAB56E: retry constants for reserveStock() exponential backoff
+    private static final int    MAX_ATTEMPTS       = 3;
+    private static final long   INITIAL_BACKOFF_MS = 200L;
+
     private final LogStore logStore;
 
     @Value("${app.chaos.intermittent-failure-rate:0.25}")
@@ -67,6 +71,10 @@ public class InventoryService {
 
     /**
      * Reserve stock for an order.
+     *
+     * INC-20260509162009-AAB56E: wraps the transient-failure path in an exponential-backoff
+     * retry loop (up to MAX_ATTEMPTS) so that a momentary STORE_TIMEOUT no longer propagates
+     * immediately as a RESERVATION_EXCEPTION in OrderService.
      */
     public boolean reserveStock(String productId, int quantity, String traceId) {
         TraceContext.setService(SVC);
@@ -84,49 +92,87 @@ public class InventoryService {
             return false;
         }
 
-        if (shouldFail()) {
-            String[] codes = {"INV_TIMEOUT", "STORE_TIMEOUT", "WAREHOUSE_DELAY", "INV_SVC_TIMEOUT"};
-            String[] msgs  = {
-                "inv svc timeout — reservation incomplete prod=" + productId,
-                "store momentarily unavailable, hold not applied",
-                "warehouse feed delayed — stock not committed for " + productId,
-                "reservation timed out — retrying reserve op"
-            };
-            int pick = rng.nextInt(codes.length);
-            log.warn("inv svc timeout productId={}", productId);
-            logStore.warn(SVC, traceId, codes[pick], msgs[pick]);
-            throw new RuntimeException("Inventory store transient failure");
+        // --- INC-20260509162009-AAB56E: retry loop with exponential backoff ---
+        RuntimeException lastTransientError = null;
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+
+            if (shouldFail()) {
+                // Transient store failure — log the attempt, back off, then retry
+                String[] codes = {"INV_TIMEOUT", "STORE_TIMEOUT", "WAREHOUSE_DELAY", "INV_SVC_TIMEOUT"};
+                String[] msgs  = {
+                    "inv svc timeout — reservation incomplete prod=" + productId,
+                    "store momentarily unavailable, hold not applied",
+                    "warehouse feed delayed — stock not committed for " + productId,
+                    "reservation timed out — retrying reserve op"
+                };
+                int pick = rng.nextInt(codes.length);
+                log.warn("inv svc timeout productId={} attempt={}/{}", productId, attempt, MAX_ATTEMPTS);
+                logStore.warn(SVC, traceId, codes[pick], msgs[pick]
+                        + " (attempt " + attempt + "/" + MAX_ATTEMPTS + ")");
+
+                lastTransientError = new RuntimeException("Inventory store transient failure");
+
+                if (attempt < MAX_ATTEMPTS) {
+                    // Exponential backoff: 200 ms, 400 ms, … before each subsequent attempt
+                    long backoffMs = INITIAL_BACKOFF_MS * (1L << (attempt - 1));
+                    log.info("Backing off for {} ms before retry attempt {}/{} productId={}",
+                            backoffMs, attempt + 1, MAX_ATTEMPTS, productId);
+                    logStore.info(SVC, traceId, "STORE_RETRY_BACKOFF",
+                            "retrying reservation in " + backoffMs + " ms for " + productId
+                            + " attempt=" + attempt + "/" + MAX_ATTEMPTS);
+                    try {
+                        Thread.sleep(backoffMs);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        logStore.warn(SVC, traceId, "RETRY_INTERRUPTED",
+                                "backoff interrupted on attempt " + attempt + " for " + productId);
+                        throw new RuntimeException("Reservation retry interrupted", ie);
+                    }
+                }
+                // Continue to next attempt
+                continue;
+            }
+
+            // No transient failure on this attempt — proceed with stock check and commit
+            int current = item.getStock();
+            log.info("Current stock for {} = {}, requesting {} (attempt {}/{})",
+                    productId, current, quantity, attempt, MAX_ATTEMPTS);
+
+            if (current < quantity) {
+                String[] msgs = {
+                    "insufficient stock — available=" + current + " requested=" + quantity + " sku=" + productId,
+                    "stock check fail: have=" + current + " need=" + quantity,
+                    "cannot reserve — stock level below threshold for " + productId
+                };
+                log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
+                logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
+                return false;
+            }
+
+            try { Thread.sleep(10); } catch (InterruptedException ignored) {}
+
+            item.setStock(current - quantity);
+            item.setReservedStock(item.getReservedStock() + quantity);
+            item.setLastUpdated(Instant.now());
+
+            log.info("Stock reserved productId={} reserved={} remaining={} (attempt {}/{})",
+                    productId, quantity, item.getStock(), attempt, MAX_ATTEMPTS);
+            if (rng.nextInt(10) < 8) {
+                logStore.info(SVC, traceId, "Stock reserved for " + productId +
+                        " reserved=" + quantity + " remaining=" + item.getStock());
+            } else {
+                logStore.info(SVC, traceId, "reservation ok sku=" + productId + " qty=" + quantity);
+            }
+
+            return true; // Reservation succeeded
         }
+        // --- end retry loop ---
 
-        int current = item.getStock();
-        log.info("Current stock for {} = {}, requesting {}", productId, current, quantity);
-
-        if (current < quantity) {
-            String[] msgs = {
-                "insufficient stock — available=" + current + " requested=" + quantity + " sku=" + productId,
-                "stock check fail: have=" + current + " need=" + quantity,
-                "cannot reserve — stock level below threshold for " + productId
-            };
-            log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
-            logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
-            return false;
-        }
-
-        try { Thread.sleep(10); } catch (InterruptedException ignored) {}
-
-        item.setStock(current - quantity);
-        item.setReservedStock(item.getReservedStock() + quantity);
-        item.setLastUpdated(Instant.now());
-
-        log.info("Stock reserved productId={} reserved={} remaining={}", productId, quantity, item.getStock());
-        if (rng.nextInt(10) < 8) {
-            logStore.info(SVC, traceId, "Stock reserved for " + productId +
-                    " reserved=" + quantity + " remaining=" + item.getStock());
-        } else {
-            logStore.info(SVC, traceId, "reservation ok sku=" + productId + " qty=" + quantity);
-        }
-
-        return true;
+        // All MAX_ATTEMPTS exhausted — surface the last transient error to the caller
+        log.error("All {} reservation attempts exhausted for productId={}", MAX_ATTEMPTS, productId);
+        logStore.error(SVC, traceId, "STORE_TIMEOUT_EXHAUSTED",
+                "Reservation failed after " + MAX_ATTEMPTS + " attempts for " + productId);
+        throw lastTransientError;
     }
 
     /**

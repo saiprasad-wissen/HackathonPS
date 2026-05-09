@@ -147,19 +147,20 @@ public class InventoryService {
             return true;
         }
 
-        int newStock = item.getStockRef().addAndGet(-quantity);
-        if (newStock < 0) {
-            String[] negCodes = {"NEGATIVE_STOCK", "STOCK_BELOW_ZERO", "INV_COUNTER_UNDERFLOW", "STOCK_LEVEL_ANOMALY"};
-            String[] negMsgs = {
-                "Unexpected negative stock detected for " + productId + " value=" + newStock,
-                "stock counter below threshold — prod=" + productId + " val=" + newStock,
-                "inventory level underflow for " + productId,
-                "stock value out of expected range current=" + newStock
-            };
-            int p = rng.nextInt(negCodes.length);
-            log.warn("stock below zero productId={} stock={}", productId, newStock);
-            logStore.warn(SVC, traceId, negCodes[p], negMsgs[p]);
+        // FIX (INC-20260509162009-019CC2): Validate that stock will not go negative before
+        // applying the deduction; reject the operation and return false if it would underflow.
+        int currentStock = item.getStockRef().get();
+        if (currentStock < quantity) {
+            log.warn("Deduction rejected — insufficient stock productId={} available={} requested={}",
+                    productId, currentStock, quantity);
+            logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK_FOR_DEDUCTION",
+                    "Stock deduction aborted — would result in negative stock for " + productId
+                            + " available=" + currentStock + " requested=" + quantity);
+            return false;
         }
+
+        // Safe to deduct: stock level is guaranteed to remain >= 0 after this operation.
+        int newStock = item.getStockRef().addAndGet(-quantity);
 
         item.setLastUpdated(Instant.now());
         log.info("Stock deducted productId={} newStock={}", productId, newStock);

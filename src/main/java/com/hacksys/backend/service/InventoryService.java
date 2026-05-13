@@ -65,16 +65,31 @@ public class InventoryService {
         return inventory.get(productId);
     }
 
+    // Idempotency store: tracks completed reservation keys so retries are no-ops
+    // (INC-20260513090853-85EDFA — prevents duplicate stock deductions on retry).
+    private final ConcurrentHashMap<String, Boolean> completedReservations = new ConcurrentHashMap<>();
+
     /**
      * Reserve stock for an order.
+     *
+     * @param idempotencyKey caller-supplied key (orderId:productId) ensuring retries are safe.
      */
-    public boolean reserveStock(String productId, int quantity, String traceId) {
+    public boolean reserveStock(String productId, int quantity, String traceId, String idempotencyKey) {
         TraceContext.setService(SVC);
         TraceContext.bindTrace(traceId);
         MDC.put("product_id", productId);
 
-        log.info("Attempting to reserve stock productId={} qty={}", productId, quantity);
+        log.info("Attempting to reserve stock productId={} qty={} key={}", productId, quantity, idempotencyKey);
         logStore.info(SVC, traceId, "Stock reservation requested for " + productId + " qty=" + quantity);
+
+        // Idempotency check: if this exact reservation already completed, return success immediately
+        // without touching stock counters (INC-20260513090853-85EDFA).
+        if (idempotencyKey != null && completedReservations.containsKey(idempotencyKey)) {
+            log.info("Idempotent reservation detected — skipping duplicate deduction productId={} key={}",
+                    productId, idempotencyKey);
+            logStore.info(SVC, traceId, "Idempotent reservation: already completed for key=" + idempotencyKey);
+            return true;
+        }
 
         InventoryItem item = inventory.get(productId);
         if (item == null) {
@@ -98,25 +113,32 @@ public class InventoryService {
             throw new RuntimeException("Inventory store transient failure");
         }
 
-        int current = item.getStock();
-        log.info("Current stock for {} = {}, requesting {}", productId, current, quantity);
+        // Atomic CAS loop: eliminates the read-then-write race condition that allowed oversell
+        // when two threads both read the same stock level concurrently (INC-20260513090853-85EDFA).
+        int current;
+        do {
+            current = item.getStockRef().get();
+            log.info("Current stock for {} = {}, requesting {}", productId, current, quantity);
+            if (current < quantity) {
+                String[] msgs = {
+                    "insufficient stock — available=" + current + " requested=" + quantity + " sku=" + productId,
+                    "stock check fail: have=" + current + " need=" + quantity,
+                    "cannot reserve — stock level below threshold for " + productId
+                };
+                log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
+                logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
+                return false;
+            }
+            // Retry the CAS if another thread modified the counter between our read and write
+        } while (!item.getStockRef().compareAndSet(current, current - quantity));
 
-        if (current < quantity) {
-            String[] msgs = {
-                "insufficient stock — available=" + current + " requested=" + quantity + " sku=" + productId,
-                "stock check fail: have=" + current + " need=" + quantity,
-                "cannot reserve — stock level below threshold for " + productId
-            };
-            log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
-            logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
-            return false;
-        }
-
-        try { Thread.sleep(10); } catch (InterruptedException ignored) {}
-
-        item.setStock(current - quantity);
         item.setReservedStock(item.getReservedStock() + quantity);
         item.setLastUpdated(Instant.now());
+
+        // Record the completed reservation so any retry from OrderService is a no-op
+        if (idempotencyKey != null) {
+            completedReservations.put(idempotencyKey, Boolean.TRUE);
+        }
 
         log.info("Stock reserved productId={} reserved={} remaining={}", productId, quantity, item.getStock());
         if (rng.nextInt(10) < 8) {
@@ -127,6 +149,14 @@ public class InventoryService {
         }
 
         return true;
+    }
+
+    /**
+     * Backward-compatible overload — delegates to the idempotency-aware variant with a null key.
+     * Retained so any internal callers that do not have an idempotency key still compile.
+     */
+    public boolean reserveStock(String productId, int quantity, String traceId) {
+        return reserveStock(productId, quantity, traceId, null);
     }
 
     /**

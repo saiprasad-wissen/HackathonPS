@@ -90,6 +90,11 @@ public class OrderService {
         List<Order.OrderItem> compensatingReservations = new ArrayList<>(); // saga compensation log
         boolean allReserved = true;
 
+        // Reservation retry policy: up to 3 attempts with exponential back-off (50 ms, 100 ms, 200 ms)
+        // to handle transient WAREHOUSE_DELAY / INV_SVC_TIMEOUT failures (INC-20260513090853-85EDFA).
+        final int MAX_RESERVE_ATTEMPTS = 3;
+        final long RETRY_BASE_DELAY_MS  = 50;
+
         for (Order.OrderItem item : items) {
             if (item.getProductId() == null) {
                 log.warn("Item with null productId encountered in order orderId={}", orderId);
@@ -98,31 +103,63 @@ public class OrderService {
                 allReserved = false;
                 break; // treat as reservation failure — will compensate below
             }
-            try {
-                boolean reserved = inventoryService.reserveStock(item.getProductId(), item.getQuantity(), traceId);
-                if (reserved) {
-                    compensatingReservations.add(item); // record for potential rollback
-                } else {
-                    allReserved = false;
-                    log.warn("Inventory reservation failed for item productId={} orderId={}",
-                            item.getProductId(), orderId);
-                    logStore.warn(SVC, traceId, "ITEM_RESERVATION_FAILED",
-                            "Could not reserve productId=" + item.getProductId() + " for orderId=" + orderId);
-                    break; // stop attempting further reservations
+
+            boolean reserved      = false;
+            RuntimeException lastEx = null;
+
+            // Idempotency key: orderId + productId uniquely identifies a reservation attempt;
+            // pass it through so InventoryService can deduplicate on retry.
+            String idempotencyKey = orderId + ":" + item.getProductId();
+
+            for (int attempt = 1; attempt <= MAX_RESERVE_ATTEMPTS; attempt++) {
+                try {
+                    reserved = inventoryService.reserveStock(
+                            item.getProductId(), item.getQuantity(), traceId, idempotencyKey);
+                    lastEx = null;
+                    break; // reservation succeeded — exit retry loop
+                } catch (RuntimeException e) {
+                    lastEx = e;
+                    log.warn("Reservation attempt {}/{} failed productId={} orderId={} error={}",
+                            attempt, MAX_RESERVE_ATTEMPTS, item.getProductId(), orderId, e.getMessage());
+                    logStore.warn(SVC, traceId, "RESERVATION_RETRY",
+                            "Retry attempt " + attempt + "/" + MAX_RESERVE_ATTEMPTS
+                            + " for productId=" + item.getProductId()
+                            + " orderId=" + orderId + " — " + e.getMessage());
+                    if (attempt < MAX_RESERVE_ATTEMPTS) {
+                        try {
+                            // Exponential back-off before next attempt
+                            Thread.sleep(RETRY_BASE_DELAY_MS * (1L << (attempt - 1)));
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
                 }
-            } catch (RuntimeException e) {
+            }
+
+            if (lastEx != null) {
+                // All retry attempts exhausted — treat as reservation failure
                 allReserved = false;
                 String pid = item.getProductId();
-                log.error("Exception during inventory reservation productId={} orderId={} error={}",
-                        pid, orderId, e.getMessage());
+                log.error("Reservation failed after {} attempts productId={} orderId={} error={}",
+                        MAX_RESERVE_ATTEMPTS, pid, orderId, lastEx.getMessage());
                 String[] exCodes = {"RESERVATION_EXCEPTION", "INV_RESERVE_ERR", "STOCK_HOLD_FAILED"};
                 String[] exMsgs  = {
                     "Reservation threw exception for productId=" + pid + " orderId=" + orderId,
-                    "inv reserve failed — " + e.getMessage(),
+                    "inv reserve failed — " + lastEx.getMessage(),
                     "stock hold not applied for orderId=" + orderId + (pid != null ? " sku=" + pid : "")
                 };
-                logStore.error(SVC, traceId, exCodes[rng.nextInt(exCodes.length)], exMsgs[rng.nextInt(exMsgs.length)]);
+                logStore.error(SVC, traceId, exCodes[rng.nextInt(exCodes.length)],
+                        exMsgs[rng.nextInt(exMsgs.length)]);
+                break; // stop attempting further items
+            } else if (!reserved) {
+                allReserved = false;
+                log.warn("Inventory reservation failed for item productId={} orderId={}",
+                        item.getProductId(), orderId);
+                logStore.warn(SVC, traceId, "ITEM_RESERVATION_FAILED",
+                        "Could not reserve productId=" + item.getProductId() + " for orderId=" + orderId);
                 break; // stop attempting further reservations
+            } else {
+                compensatingReservations.add(item); // record for potential rollback
             }
         }
 

@@ -98,25 +98,31 @@ public class InventoryService {
             throw new RuntimeException("Inventory store transient failure");
         }
 
-        int current = item.getStock();
-        log.info("Current stock for {} = {}, requesting {}", productId, current, quantity);
+        // FIX INC-20260513083526-6D2938: synchronize on the item instance to make the
+        // check-then-act (read stock → validate → decrement stock + increment reserved)
+        // a single atomic critical section, eliminating the race that inflated
+        // reservedStock and triggered HIGH_RESERVATION_RATIO alerts.
+        // The artificial Thread.sleep that widened the race window is also removed.
+        synchronized (item) {
+            int current = item.getStock();
+            log.info("Current stock for {} = {}, requesting {}", productId, current, quantity);
 
-        if (current < quantity) {
-            String[] msgs = {
-                "insufficient stock — available=" + current + " requested=" + quantity + " sku=" + productId,
-                "stock check fail: have=" + current + " need=" + quantity,
-                "cannot reserve — stock level below threshold for " + productId
-            };
-            log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
-            logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
-            return false;
+            if (current < quantity) {
+                String[] msgs = {
+                    "insufficient stock — available=" + current + " requested=" + quantity + " sku=" + productId,
+                    "stock check fail: have=" + current + " need=" + quantity,
+                    "cannot reserve — stock level below threshold for " + productId
+                };
+                log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
+                logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
+                return false;
+            }
+
+            // Atomic debit of available stock and credit of reserved stock within the same lock.
+            item.getStockRef().addAndGet(-quantity);
+            item.getReservedStockRef().addAndGet(quantity);
+            item.setLastUpdated(Instant.now());
         }
-
-        try { Thread.sleep(10); } catch (InterruptedException ignored) {}
-
-        item.setStock(current - quantity);
-        item.setReservedStock(item.getReservedStock() + quantity);
-        item.setLastUpdated(Instant.now());
 
         log.info("Stock reserved productId={} reserved={} remaining={}", productId, quantity, item.getStock());
         if (rng.nextInt(10) < 8) {

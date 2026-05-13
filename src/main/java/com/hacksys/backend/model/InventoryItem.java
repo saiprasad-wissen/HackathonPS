@@ -11,7 +11,9 @@ public class InventoryItem {
     private String name;
     // Intentional: AtomicInteger gives atomic single-ops but NOT atomic check-then-act
     private final AtomicInteger stock = new AtomicInteger(0);
-    private int reservedStock;
+    // FIX INC-20260513083526-6D2938: back reservedStock with AtomicInteger to prevent
+    // lost-update races when multiple threads increment the counter concurrently.
+    private final AtomicInteger reservedStockRef = new AtomicInteger(0);
     private double price;
     private Instant lastUpdated;
     // Intentional: no update history / audit trail
@@ -24,7 +26,7 @@ public class InventoryItem {
         this.name = name;
         this.stock.set(initialStock);
         this.price = price;
-        this.reservedStock = 0;
+        this.reservedStockRef.set(0);
         this.lastUpdated = Instant.now();
     }
 
@@ -42,8 +44,11 @@ public class InventoryItem {
 
     public AtomicInteger getStockRef() { return stock; }
 
-    public int getReservedStock() { return reservedStock; }
-    public void setReservedStock(int reservedStock) { this.reservedStock = reservedStock; }
+    // FIX INC-20260513083526-6D2938: delegate to AtomicInteger so all callers get
+    // a consistent, thread-safe view of the reserved quantity.
+    public int getReservedStock() { return reservedStockRef.get(); }
+    public void setReservedStock(int value) { reservedStockRef.set(value); }
+    public AtomicInteger getReservedStockRef() { return reservedStockRef; }
 
     public double getPrice() { return price; }
     public void setPrice(double price) { this.price = price; }

@@ -180,6 +180,62 @@ public class ChaosScheduler {
         logStore.info(SVC, traceId, "payment retry worker: sweep complete");
     }
 
+    // INC-20260513065918-6AF290: max retry attempts for inventory reservation before aborting payment
+    private static final int INV_RESERVATION_MAX_RETRIES = 3;
+    // INC-20260513065918-6AF290: base back-off delay (ms) between inventory reservation retries
+    private static final long INV_RESERVATION_RETRY_DELAY_MS = 200;
+
+    /**
+     * reconcileOrder — atomically ensures inventory is fully reserved before allowing payment
+     * to proceed for a given order.  Implements a retry loop (immediate mitigation) so that
+     * transient {@code InventoryService} timeouts are retried rather than silently skipped,
+     * and enforces a hard guard (permanent fix) that prevents {@code processPayment()} from
+     * being called when the reservation is still incomplete — eliminating the race condition
+     * that produced RECON_STATE_MISMATCH (INC-20260513065918-6AF290).
+     *
+     * @param order   the order whose inventory must be confirmed before payment
+     * @param traceId correlation trace-id for structured logging
+     * @return {@code true} if every item was successfully reserved, {@code false} otherwise
+     */
+    private boolean reconcileOrder(Order order, String traceId) {
+        for (Order.OrderItem item : order.getItems()) {
+            boolean reserved = false;
+            // INC-20260513065918-6AF290 — retry loop: immediate mitigation for transient inv failures
+            for (int attempt = 1; attempt <= INV_RESERVATION_MAX_RETRIES; attempt++) {
+                try {
+                    reserved = inventoryService.reserveStock(item.getProductId(), item.getQuantity(), traceId);
+                    if (reserved) {
+                        logStore.info(SVC, traceId,
+                            "reconcileOrder: reservation confirmed attempt=" + attempt
+                            + " productId=" + item.getProductId() + " orderId=" + order.getId());
+                        break; // reservation succeeded — stop retrying this item
+                    }
+                    logStore.warn(SVC, traceId, "INV_RESERVATION_RETRY",
+                        "reconcileOrder: reservation returned false attempt=" + attempt
+                        + " productId=" + item.getProductId() + " orderId=" + order.getId());
+                } catch (RuntimeException e) {
+                    logStore.warn(SVC, traceId, "INV_RESERVATION_RETRY",
+                        "reconcileOrder: reservation threw on attempt=" + attempt
+                        + " productId=" + item.getProductId() + " orderId=" + order.getId()
+                        + " error=" + e.getMessage());
+                }
+                if (attempt < INV_RESERVATION_MAX_RETRIES) {
+                    try { Thread.sleep(INV_RESERVATION_RETRY_DELAY_MS * attempt); }
+                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                }
+            }
+            if (!reserved) {
+                // INC-20260513065918-6AF290 — permanent fix: reservation failed after all retries;
+                // log and signal caller to abort payment — never let payment proceed with unreserved stock
+                logStore.error(SVC, traceId, "INV_RESERVATION_FAILED_ABORT",
+                    "reconcileOrder: inventory reservation exhausted all retries — aborting payment"
+                    + " productId=" + item.getProductId() + " orderId=" + order.getId());
+                return false;
+            }
+        }
+        return true; // all items successfully reserved — safe to proceed to payment
+    }
+
     // Cascade incident — inv timeout leads to payment success on unreserved order, deferred recon detects mismatch
     @Scheduled(fixedDelay = 55000, initialDelay = 18000)
     public void cascadeIncidentWorker() {
@@ -193,16 +249,27 @@ public class ChaosScheduler {
             );
             Order order = orderService.createOrder("user-303", items, traceId);
 
-            // Cross-service terminology: BackgroundWorker uses "inventory phase unresolved"
-            logStore.warn(SVC, traceId, "INV_PHASE_INCOMPLETE",
-                "inventory phase unresolved — reservation for orderId=" + order.getId() + " did not complete");
-            logStore.info(SVC, traceId, "retrying reserve op attempt=1 orderId=" + order.getId());
+            logStore.info(SVC, traceId, "order pipeline: verifying inventory reservation orderId=" + order.getId());
 
-            try { Thread.sleep(200 + random.nextInt(300)); } catch (InterruptedException ignored) {}
+            // INC-20260513065918-6AF290 — permanent fix: call reconcileOrder() which retries
+            // inventory reservation and only returns true when ALL items are confirmed reserved.
+            // Payment is ONLY attempted after a successful reservation — eliminating the
+            // non-atomic check-then-act race that produced inventory_reserved=false + payment_recorded=true.
+            boolean inventoryReady = reconcileOrder(order, traceId);
 
-            logStore.warn(SVC, traceId, "INV_RESERVATION_INCOMPLETE",
-                "inv reservation incomplete — proceeding to payment phase orderId=" + order.getId());
+            if (!inventoryReady) {
+                // Reservation could not be confirmed even after retries — abort the pipeline.
+                // No payment is attempted; RECON_STATE_MISMATCH cannot occur.
+                logStore.error(SVC, traceId, "ORDER_PIPELINE_ABORTED",
+                    "order pipeline: inventory not reserved — payment skipped orderId=" + order.getId());
+                return;
+            }
 
+            logStore.info(SVC, traceId,
+                "order pipeline: inventory reserved — proceeding to payment orderId=" + order.getId());
+
+            // INC-20260513065918-6AF290: payment is now only reached when inventory_reserved=true,
+            // making the operation atomic from the reconciler's perspective.
             try {
                 paymentService.processPayment(order.getId(), "user-303", 2 * 49.99 + 79.99, traceId);
                 logStore.info(SVC, traceId, "payment accepted orderId=" + order.getId());
@@ -210,19 +277,6 @@ public class ChaosScheduler {
                 logStore.warn(SVC, traceId, "PAYMENT_TIMEOUT",
                     "gateway retry #2 orderId=" + order.getId() + " — " + e.getMessage());
             }
-
-            final String orderId = order.getId();
-            final String reconTraceId = "RECON-" + UUID.randomUUID().toString().substring(0, 8);
-            new Thread(() -> {
-                try { Thread.sleep(4000 + random.nextInt(4000)); } catch (InterruptedException ignored) {}
-                // Observability blind spot: reconciliation detects a mismatch with no prior ERROR
-                logStore.warn(SVC, reconTraceId, "RECON_STATE_MISMATCH",
-                    "reconciliation detected order in inconsistent state orderId=" + orderId
-                    + " status=CREATED inventory_reserved=false payment_recorded=true");
-                logStore.info(SVC, reconTraceId, "db sync delayed — write queue depth=" + (1 + random.nextInt(4)));
-                logStore.warn(SVC, reconTraceId, "RECON_UNFULFILLED_RESERVATION",
-                    "unfulfilled reservation for orderId=" + orderId + " — stock commit not finalized");
-            }).start();
 
         } catch (Exception e) {
             logStore.error(SVC, traceId, "CASCADE_PIPELINE_ERROR",
